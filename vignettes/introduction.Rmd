@@ -1,0 +1,214 @@
+---
+title: "Introduction to hydrorecipes"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Introduction to hydrorecipes}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE,
+  dev = 'png',
+  out.width = "90%"
+)
+```
+
+
+The **hydrorecipes** package aims to provide a few steps to improve the analysis of water level responses using moderately sized datasets (millions of rows). It aims to work seamlessly within the **tidymodels** framework of packages.  While the package was designed for water levels and pore-pressures, the *steps* may be useful in other fields of study. Examples in the introduction focus on barometric pressure and Earth tides, the *steps* may also be applied to precipitation, river stage, ocean tides, and pumping responses.
+
+
+```{r setup}
+library(hydrorecipes)
+library(earthtide)
+library(ggplot2)
+library(splines2)
+library(tidyr)
+
+data(transducer, package = "hydrorecipes")
+head(transducer)
+transducer$datetime_num <- as.numeric(transducer$datetime)
+```
+
+
+This data contains (~1.5 months) of timestamped water pressure, barometric 
+pressure and synthetic Earth tide data with a 2 minute sampling frequency.
+Our goal is to relate the water pressure data to the barometric, Earth tides 
+in the presence of a background trend. We will look at a few different ways to 
+analyze this dataset. For more information on the **recipes** package and 
+**tidymodels** please see: https://recipes.tidymodels.org
+
+## Modified Toll and Rasmussen 2007
+
+To start with we will use the **recipes** package alone using a modified Toll
+and Rasmussen, 2007 approach. We use logarithmically spaced lags instead of 
+regularly spaced ones to improve computational performance and use the 
+non-difference based approach.  *step_ns* is used to characterize the background
+trend.
+
+```{r}
+
+rec_toll_rasmussen <- recipe(wl~baro+et+datetime_num, transducer) |>
+  step_lead_lag(baro, lag = log_lags(100, 86400 * 2 / 120)) |>
+  step_lead_lag(et, lag = seq(0, 180, 20)) |>
+  step_ns(datetime_num, deg_free = 10) |>
+  prep()
+input_toll_rasmussen <- rec_toll_rasmussen |> bake(new_data = NULL)
+
+```
+
+```{r}
+fit_toll_rasmussen <- lm(wl~., input_toll_rasmussen) 
+```
+
+## Modified Rasmussen  and Mote 2007
+
+Next we will use the **recipes** package alone using a modified Rasmussen and 
+Mote, 2007 approach. We use logarithmically spaced lags instead of 
+regularly spaced ones to improve computational performance and use the 
+non-difference based approach.  *step_ns* is used to characterize the background
+trend.
+
+```{r}
+tidal_freqs <- c(0.89324406, 0.92953571, 0.96644626, 1.00273791, 1.03902956, 
+                 1.07594011, 1.86454723, 1.89598197, 1.93227362, 1.96856526, 
+                 2.00000000, 2.89841042)
+rec_rasmussen_mote <- recipe(wl~baro+datetime_num, transducer) |>
+  step_lead_lag(baro, lag = log_lags(100, 86400 * 2 / 120)) |>
+  step_harmonic(datetime_num,
+                frequency = tidal_freqs,
+                cycle_size = 86400,
+                keep_original_cols = TRUE) |>
+  step_ns(datetime_num, deg_free = 10) |>
+  prep()
+input_rasmussen_mote <- rec_rasmussen_mote |> bake(new_data = NULL)
+
+```
+
+```{r}
+fit_rasmussen_mote <- lm(wl~., input_rasmussen_mote) 
+```
+
+## Kennel 2020 method for water levels
+
+This is the method of Kennel 2020 which uses a distributed lag model (Almon, 1965, Gasparrini, 2011) and the [earthtide package](https://CRAN.R-project.org/package=earthtide) to generate synthetic wave groups. The distributed lag model was inspired by the 
+[dlnm package](https://CRAN.R-project.org/package=dlnm), but adapted for datasets with millions of rows and long maximum time lags.
+
+```{r}
+
+wave_groups <- earthtide::eterna_wavegroups
+wave_groups <- na.omit(wave_groups[wave_groups$time == '1 month', ])
+wave_groups <- wave_groups[wave_groups$start > 0.5, ]
+latitude  <- 34.0
+longitude <- -118.5
+rec_dl <- recipe(wl~baro+datetime_num, transducer) |>
+  step_distributed_lag(baro, spline_fun = splines2::bSpline,
+                       knots = log_lags(15, 86400 * 2 / 120)) |>
+  step_earthtide(datetime_num,
+                 latitude = latitude,
+                 longitude = longitude,
+                 astro_update = 1,
+                 cutoff = 1e-5,
+                 wave_groups = wave_groups) |>
+  step_ns(datetime_num, deg_free = 10) |>
+  prep()
+
+input_dl <- rec_dl |> bake(new_data = NULL)
+
+```
+
+```{r}
+fit_dl <- lm(wl~., input_dl) 
+```
+
+We can compare the three models and they give similar results.  The distributed lag version is particularly suited to long lag times and large datasets (small sampling interval). *step_earthtide* allows for easily estimating phase shifts unlike *step_harmonic* and the lagged version.
+
+```{r results = 'asis'}
+
+model_results <- rbind(broom::glance(fit_dl),
+                       broom::glance(fit_toll_rasmussen),
+                       broom::glance(fit_rasmussen_mote)
+)
+model_results$name <- c('kennel_2020',
+                        'toll_rasmussen_2007',
+                        'rasmussen_mote_2007'
+)
+knitr::kable(model_results[,c('name', 'r.squared', 'sigma', 
+                              'AIC', 'BIC', 'df.residual', 'nobs')])
+```
+
+
+## Decomposition
+
+The water pressure dataset can be thought of as a sum of multiple components.  The regression deconvolution method attempts to separate these components so that you can see the influence that each stress has on the resultant water pressure signal.
+
+```{r fig.height = 11, fig.width = 12, out.width = '90%'}
+pred <- predict_terms(fit = fit_dl, 
+                      rec = rec_dl,
+                      data = input_dl)
+pred <- bind_cols(transducer[, c('datetime', 'wl')], pred)
+pred$residuals <- pred$wl - pred$predicted
+pred_long <- pivot_longer(pred, cols = !datetime)
+levels <-c('intercept', 'ns_datetime_num', 'distributed_lag_baro',
+           'earthtide_datetime_num', 'predicted', 'wl', 'residuals')
+labels <- c('Intercept', 'Background trend', 'Barometric Component',
+            'Earth Tide Component', 'Predicted', 'Water Pressure', 
+            'Residuals (obs-mod)')
+pred_long$name <- factor(pred_long$name, 
+                         levels = levels,
+                         labels = labels)
+ggplot(pred_long, aes(x = datetime, y = value)) +
+  geom_line() + 
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_datetime(expand = c(0,0)) + 
+  ggtitle('Water Level Decomposition Results') + 
+  xlab("") + 
+  facet_grid(name~., scales = 'free_y') + 
+  theme_bw()
+```
+
+## Response
+
+The response describes how the water pressure changes after there is a change in one of the input stresses. The **hydrorecipes** package describes the response in one of two ways; using harmonics, or a response function.  These can be thought of as equivalent with one being in the time domain and the other the frequency domain.  Both method provides similar information, but depending on the analysis model or background knowledge one may be preferred over the other. Below we use a response function for barometric pressure and harmonic analysis for the Earth tides.
+
+```{r fig.height = 5, fig.width = 5, out.width = '47%', fig.show='hold'}
+resp    <- response(fit_dl, rec_dl)
+resp_ba <- resp[resp$name == 'cumulative', ]
+resp_ba <- resp_ba[resp_ba$term == 'baro', ]
+
+ggplot(resp_ba, aes(x = x * 120 / 3600, y = value)) +
+  ggtitle('A: Barometric Loading Response') + 
+  xlab('lag (hours)') +
+  ylab('Cumulative Response') +
+  scale_y_continuous(limits = c(0, 1)) +
+  geom_line() + 
+  theme_bw()
+resp_et <- resp[resp$name %in% c('amplitude', 'phase'), ]
+ggplot(resp_et, aes(x = x, xend = x, y = 0, yend = value)) +
+  geom_segment() + 
+  ggtitle('B: Earthtide Response') +
+  xlab('Frequency (cycles per day)') +
+  ylab('Phase (radians)   |   Amplitude (dbar)') +
+  facet_grid(name~., scales = 'free_y') + 
+  theme_bw()
+```
+
+
+
+# References
+
+Almon, S (1965). The Distributed Lag Between Capital Appropriations and Expenditures. Econometrica 33(1), 178.
+
+Gasparrini A. Distributed lag linear and non-linear models in R: the package dlnm. Journal of Statistical Software. 2011; 43(8):1-20. https://doi.org/10.18637/jss.v043.i08
+
+Kennel, J., 2020. High Frequency Water Level Responses to Natural Signals (Doctoral dissertation, University of Guelph). http://hdl.handle.net/10214/17890
+
+Rasmussen, T.C. and Mote, T.L., 2007. Monitoring surface and subsurface water storage using confined aquifer water levels at the Savannah River Site, USA. Vadose Zone Journal, 6(2), pp.327-335.
+
+Toll, N.J. and Rasmussen, T.C., 2007. Removal of barometric pressure effects and earth tides from observed water levels. Groundwater, 45(1), pp.101-105.
+Vancouver	
+
